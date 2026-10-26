@@ -30,7 +30,11 @@ set(SOURCES "audio/audio_codec.cc"
 
 # 正确处理ESP-ADF路径
 file(TO_CMAKE_PATH "$ENV{ADF_PATH}" ADF_PATH_CMAKE)
-set(INCLUDE_DIRS "." "display" "audio" "protocols" "D:/Software/Espressif/esp-adf/components/esp-adf-libs/esp_codec/include")
+set(INCLUDE_DIRS "." "display" "audio" "protocols")
+# esp-adf-libs 的 codec API 头文件（AAC/MP3 解码需要），仅在 ADF 存在时加入，避免硬编码本机路径
+if(ADF_PATH_CMAKE AND EXISTS "${ADF_PATH_CMAKE}/components/esp-adf-libs/esp_codec/include")
+    list(APPEND INCLUDE_DIRS "${ADF_PATH_CMAKE}/components/esp-adf-libs/esp_codec/include")
+endif()
 
 # 添加板级公共文件
 file(GLOB BOARD_COMMON_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/boards/common/*.cc)
