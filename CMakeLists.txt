@@ -7,7 +7,7 @@ cmake_minimum_required(VERSION 3.16)
 set(PROJECT_VER "1.8.6")
 
 # Add this line to disable the specific warning
-add_compile_options(-Wno-missing-field-initializers)
+add_compile_options(-Wno-missing-field-initializers -Wno-error=format=)
 
 # Include ESP-ADF if available
 if(DEFINED ENV{ADF_PATH})
