@@ -78,3 +78,7 @@ CONFIG_LV_BUILD_EXAMPLES=n
 # MP3 Decoder Configuration (Simplified implementation)
 # CONFIG_ESP_MP3_DECODER is not set
 
+# ESP-ADF audio_board 默认选经典 ESP32 的 Lyrat 板（C3 编译会因引脚不存在失败），
+# 显式选择 ADF 自带的 C3 Lyra 参考板定义
+CONFIG_ESP32_C3_LYRA_V2_BOARD=y
+
