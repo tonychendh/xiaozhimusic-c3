@@ -108,7 +108,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Prepare git-lfs
+        run: |
+          git config --global --add safe.directory '*'
+          apt-get update -qq && apt-get install -y -qq git-lfs || git lfs version
+
+      - name: Checkout ESP-ADF (for music decoders)
+        run: |
+          git clone --depth 1 --branch v2.8 --recursive --shallow-submodules \
+            https://github.com/espressif/esp-adf.git "$GITHUB_WORKSPACE/.esp-adf"
+          cd "$GITHUB_WORKSPACE/.esp-adf"
+          git lfs install --local || true
+          git submodule foreach --recursive 'git lfs pull || true'
+
       - name: Build current board
+        env:
+          ADF_PATH: ${{ github.workspace }}/.esp-adf
         shell: bash
         run: |
           source $IDF_PATH/export.sh
