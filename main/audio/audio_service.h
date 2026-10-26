@@ -1,0 +1,195 @@
+#ifndef AUDIO_SERVICE_H
+#define AUDIO_SERVICE_H
+
+#include <memory>
+#include <deque>
+#include <condition_variable>
+#include <chrono>
+#include <mutex>
+
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/event_groups.h>
+#include <esp_timer.h>
+
+#include <opus_encoder.h>
+#include <opus_decoder.h>
+#include <opus_resampler.h>
+
+#include "audio_codec.h"
+#include "audio_processor.h"
+#include "processors/audio_debugger.h"
+#include "wake_word.h"
+#include "protocol.h"
+#include "m4a_decoder.h"
+#include "esp_adf_mp3_player.h"
+
+
+/*
+ * There are two types of audio data flow:
+ * 1. (MIC) -> [Processors] -> {Encode Queue} -> [Opus Encoder] -> {Send Queue} -> (Server)
+ * 2. (Server) -> {Decode Queue} -> [Opus Decoder] -> {Playback Queue} -> (Speaker)
+ *
+ * We use one task for MIC / Speaker / Processors, and one task for Opus Encoder / Opus Decoder.
+ * 
+ * Decode Queue and Send Queue are the main queues, because Opus packets are quite smaller than PCM packets.
+ * 
+ */
+
+#define OPUS_FRAME_DURATION_MS 60
+#define MAX_ENCODE_TASKS_IN_QUEUE 2
+#define MAX_PLAYBACK_TASKS_IN_QUEUE 2
+#define MAX_DECODE_PACKETS_IN_QUEUE (4800 / OPUS_FRAME_DURATION_MS)  // 增加到4秒缓冲
+#define MAX_SEND_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
+#define AUDIO_TESTING_MAX_DURATION_MS 10000
+#define MAX_TIMESTAMPS_IN_QUEUE 3
+
+#define AUDIO_POWER_TIMEOUT_MS 15000
+#define AUDIO_POWER_CHECK_INTERVAL_MS 1000
+
+
+#define AS_EVENT_AUDIO_TESTING_RUNNING      (1 << 0)
+#define AS_EVENT_WAKE_WORD_RUNNING          (1 << 1)
+#define AS_EVENT_AUDIO_PROCESSOR_RUNNING    (1 << 2)
+#define AS_EVENT_PLAYBACK_NOT_EMPTY         (1 << 3)
+
+struct AudioServiceCallbacks {
+    std::function<void(void)> on_send_queue_available;
+    std::function<void(const std::string&)> on_wake_word_detected;
+    std::function<void(bool)> on_vad_change;
+    std::function<void(void)> on_audio_testing_queue_full;
+};
+
+
+enum AudioTaskType {
+    kAudioTaskTypeEncodeToSendQueue,
+    kAudioTaskTypeEncodeToTestingQueue,
+    kAudioTaskTypeDecodeToPlaybackQueue,
+};
+
+struct AudioTask {
+    AudioTaskType type;
+    std::vector<int16_t> pcm;
+    uint32_t timestamp;
+};
+
+struct DebugStatistics {
+    uint32_t input_count = 0;
+    uint32_t decode_count = 0;
+    uint32_t encode_count = 0;
+    uint32_t playback_count = 0;
+};
+
+class AudioService {
+public:
+    AudioService();
+    ~AudioService();
+
+    void Initialize(AudioCodec* codec);
+    void Start();
+    void Stop();
+    void EncodeWakeWord();
+    std::unique_ptr<AudioStreamPacket> PopWakeWordPacket();
+    const std::string& GetLastWakeWord() const;
+    bool IsVoiceDetected() const { return voice_detected_; }
+    bool IsIdle();
+    bool IsWakeWordRunning() const { return xEventGroupGetBits(event_group_) & AS_EVENT_WAKE_WORD_RUNNING; }
+    bool IsAudioProcessorRunning() const { return xEventGroupGetBits(event_group_) & AS_EVENT_AUDIO_PROCESSOR_RUNNING; }
+
+    void EnableWakeWordDetection(bool enable);
+    void EnableVoiceProcessing(bool enable);
+    void EnableAudioTesting(bool enable);
+    void EnableDeviceAec(bool enable);
+
+    void SetCallbacks(AudioServiceCallbacks& callbacks);
+
+    bool PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait = false);
+    std::unique_ptr<AudioStreamPacket> PopPacketFromSendQueue();
+    void PlaySound(const std::string_view& sound);
+    bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
+    void ResetDecoder();
+    void PlayMusicFromUrl(const std::string& url);
+    void StopMusic();
+    bool IsMusicPlaying() const { return music_playing_; }
+    void SetMusicMode(bool enabled);  // 设置音乐播放模式，控制音频输入处理
+private:
+    AudioCodec* codec_ = nullptr;
+    AudioServiceCallbacks callbacks_;
+    std::unique_ptr<AudioProcessor> audio_processor_;
+    std::unique_ptr<WakeWord> wake_word_;
+    std::unique_ptr<AudioDebugger> audio_debugger_;
+    std::unique_ptr<OpusEncoderWrapper> opus_encoder_;
+    std::unique_ptr<OpusDecoderWrapper> opus_decoder_;
+    OpusResampler input_resampler_;
+    OpusResampler reference_resampler_;
+    OpusResampler output_resampler_;
+    DebugStatistics debug_statistics_;
+
+    EventGroupHandle_t event_group_;
+
+    // Audio encode / decode
+    TaskHandle_t audio_input_task_handle_ = nullptr;
+    TaskHandle_t audio_output_task_handle_ = nullptr;
+    TaskHandle_t opus_codec_task_handle_ = nullptr;
+    std::mutex audio_queue_mutex_;
+    std::condition_variable audio_queue_cv_;
+    std::deque<std::unique_ptr<AudioStreamPacket>> audio_decode_queue_;
+    std::deque<std::unique_ptr<AudioStreamPacket>> audio_send_queue_;
+    std::deque<std::unique_ptr<AudioStreamPacket>> audio_testing_queue_;
+    std::deque<std::unique_ptr<AudioTask>> audio_encode_queue_;
+    // 统一的音频播放队列（用于所有音频播放）
+    std::deque<std::vector<int16_t>> audio_playback_queue_;
+    std::mutex audio_playback_mutex_;
+    std::condition_variable audio_playback_cv_;
+    
+    // 多线程音频处理队列
+    std::deque<std::vector<uint8_t>> raw_audio_queue_;  // 原始音频数据队列
+    std::mutex raw_audio_mutex_;
+    std::condition_variable raw_audio_cv_;
+    std::deque<std::vector<int16_t>> processed_pcm_queue_;  // 处理后的PCM队列
+    std::mutex processed_pcm_mutex_;
+    std::condition_variable processed_pcm_cv_;
+    // For server AEC
+    std::deque<uint32_t> timestamp_queue_;
+    // 音乐播放相关
+    std::string current_music_url_;
+    TaskHandle_t music_task_handle_ = nullptr;
+    TaskHandle_t audio_decoder_task_handle_ = nullptr;  // 音频解码任务
+    TaskHandle_t audio_buffer_mgr_task_handle_ = nullptr;  // 缓冲区管理任务
+    
+    // M4A解码器
+    std::unique_ptr<M4aDecoder> m4a_decoder_;
+    
+    // ESP-ADF MP3播放器
+    std::unique_ptr<EspAdfMp3Player> esp_adf_mp3_player_;
+
+    bool wake_word_initialized_ = false;
+    bool audio_processor_initialized_ = false;
+    bool voice_detected_ = false;
+    bool service_stopped_ = true;
+    bool audio_input_need_warmup_ = false;
+    bool music_playing_ = false;
+
+    esp_timer_handle_t audio_power_timer_ = nullptr;
+    std::chrono::steady_clock::time_point last_input_time_;
+    std::chrono::steady_clock::time_point last_output_time_;
+
+    void AudioInputTask();
+    void AudioOutputTask();
+    void OpusCodecTask();
+    void PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm);
+    void SetDecodeSampleRate(int sample_rate, int frame_duration);
+    void CheckAndUpdateAudioPowerState();
+
+    // MP3音乐流任务
+    void MusicStreamTask();
+    void M4aPcmDataTask(); // 从M4A解码器获取PCM数据的任务
+    std::vector<int16_t> DecodeM4aChunk(const std::vector<uint8_t>& m4a_data);
+    std::vector<int16_t> DecodeWavChunk(const std::vector<uint8_t>& wav_data);
+    
+    // 多线程音频处理任务
+    void AudioDecoderTask();  // 音频解码生产者任务
+    void AudioBufferManagerTask();  // 缓冲区管理任务
+};
+
+#endif
